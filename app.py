@@ -293,7 +293,7 @@ def run_align(audio_path: str, transcript: str, language: str | None, mode: str 
     if chunked:
         segments, warnings, anchor_coverage = long_align.chunked_align(
             audio, transcript_norm, am[0], am[1], WHISPER, GPU_LOCK,
-            BATCH_SIZE, SAMPLE_RATE, progress_cb,
+            BATCH_SIZE, SAMPLE_RATE, progress_cb, get_align_model_fn=get_align_model,
         )
     else:
         progress_cb("aligning", 0.3)

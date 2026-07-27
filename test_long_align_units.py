@@ -55,6 +55,23 @@ check("token count", len(toks) == 8)
 check("times in range", all(0 <= t <= 10 for t in times))
 check("times sorted", times == sorted(times))
 
+print("\nasr_token_times: prefers acoustic word starts, interpolates gaps")
+segs_w = [{
+    "text": "aaj hum newton ke laws",
+    "start": 0.0, "end": 10.0,   # deliberately misleading span
+    "words": [
+        {"word": "aaj", "start": 2.0, "end": 2.3},
+        {"word": "hum", "start": 2.4, "end": 2.6},
+        {"word": "newton"},                          # unaligned -> interpolated
+        {"word": "ke", "start": 3.4, "end": 3.5},
+        {"word": "laws", "start": 3.6, "end": 4.0},
+    ],
+}]
+toks, times = asr_token_times(segs_w)
+check("word starts used (not char interp)", times[0] == 2.0 and times[-1] == 3.6, times)
+check("missing word interpolated between neighbors", 2.4 < times[2] < 3.4, times[2])
+check("word-times monotonic", times == sorted(times))
+
 print("\nfind_anchors: perturbed ASR (10% dropped, 20% respelled)")
 random.seed(42)
 VOCAB = ("aaj hum ek naya chapter shuru karenge jisme newton ke laws of motion "

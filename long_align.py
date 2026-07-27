@@ -64,10 +64,13 @@ def normalize_token(tok: str) -> str:
 
 
 def asr_token_times(asr_segments: list[dict]) -> tuple[list[str], list[float]]:
-    """Flatten ASR segments to (tokens, estimated time per token).
+    """Flatten ASR segments to (tokens, time per token).
 
-    Token time = segment start + linear interpolation of the token's character
-    midpoint within the segment text. +-1-2s accuracy, plenty for windowing.
+    Prefers acoustic word-level start times (present when the ASR output was run
+    through whisperx.align), interpolating any missing ones from neighbors.
+    Falls back to character-midpoint interpolation within the segment span -
+    which can drift by seconds inside a ~30s merged segment, so word-level
+    times matter for accurate window cuts.
     """
     tokens, times = [], []
     for seg in asr_segments:
@@ -76,13 +79,38 @@ def asr_token_times(asr_segments: list[dict]) -> tuple[list[str], list[float]]:
             continue
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
-        span = max(end - start, 0.01)
-        pos = 0
-        for tok in text.split():
-            mid = pos + len(tok) / 2
-            tokens.append(tok)
-            times.append(start + span * mid / max(len(text), 1))
-            pos += len(tok) + 1
+        toks = text.split()
+        words = seg.get("words") or []
+        raw = None
+        if len(words) == len(toks):
+            raw = [float(w["start"]) if w.get("start") is not None else None for w in words]
+            if not any(v is not None for v in raw):
+                raw = None
+        if raw is None:
+            # no word-level info: character-midpoint interpolation
+            span = max(end - start, 0.01)
+            pos = 0
+            for tok in toks:
+                mid = pos + len(tok) / 2
+                tokens.append(tok)
+                times.append(start + span * mid / max(len(text), 1))
+                pos += len(tok) + 1
+            continue
+        known = [i for i, v in enumerate(raw) if v is not None]
+        first, last = known[0], known[-1]
+        for i in range(len(raw)):
+            if raw[i] is not None:
+                continue
+            if i < first:
+                raw[i] = start + (raw[first] - start) * i / max(first, 1)
+            elif i > last:
+                raw[i] = raw[last] + (end - raw[last]) * (i - last) / max(len(raw) - 1 - last, 1)
+            else:
+                j0 = max(k for k in known if k < i)
+                j1 = min(k for k in known if k > i)
+                raw[i] = raw[j0] + (raw[j1] - raw[j0]) * (i - j0) / (j1 - j0)
+        tokens.extend(toks)
+        times.extend(raw)
     return tokens, times
 
 
@@ -339,9 +367,12 @@ def chunked_align(
     batch_size: int,
     sample_rate: int,
     progress_cb=lambda stage, progress=0.0: None,
+    get_align_model_fn=None,
 ) -> tuple[list[dict], list[str], float]:
     """Full long-form pipeline. Returns (segments-with-words for postprocess_words,
     warnings, anchor_coverage). Every GT whitespace token appears exactly once."""
+    import whisperx
+
     gt_tokens = transcript_norm.split(" ")
     duration = len(audio) / sample_rate
     warnings = []
@@ -349,9 +380,30 @@ def chunked_align(
     progress_cb("transcribing", 0.05)
     with gpu_lock:
         asr = whisper_model.transcribe(audio, batch_size=batch_size)
+    asr_segments = asr["segments"]
+
+    # Acoustic word times for the ASR stream (align model picked by the ASR
+    # text's own script - Whisper may emit Devanagari against a Latin GT).
+    # Without this, anchor times come from char interpolation inside ~30s
+    # merged segments and drift by seconds, cutting windows in the wrong place.
+    if get_align_model_fn is not None and asr_segments:
+        asr_text = " ".join(s.get("text", "") for s in asr_segments)
+        n_dev = len(_DEVANAGARI.findall(asr_text))
+        n_lat = sum(1 for c in asr_text if c.isascii() and c.isalpha())
+        am2 = get_align_model_fn("hi" if n_dev > n_lat else "en")
+        if am2 is not None:
+            progress_cb("timing asr words", 0.25)
+            try:
+                with gpu_lock:
+                    asr_segments = whisperx.align(
+                        asr_segments, am2[0], am2[1], audio, "cuda",
+                        return_char_alignments=False,
+                    )["segments"]
+            except Exception:
+                log.exception("asr word-timing pass failed; using segment interpolation")
 
     progress_cb("anchoring", 0.35)
-    asr_tokens, asr_times = asr_token_times(asr["segments"])
+    asr_tokens, asr_times = asr_token_times(asr_segments)
     anchors, coverage = find_anchors(gt_tokens, asr_tokens, asr_times)
     log.info("anchoring: %d anchors, coverage %.2f, %d ASR tokens",
              len(anchors), coverage, len(asr_tokens))
