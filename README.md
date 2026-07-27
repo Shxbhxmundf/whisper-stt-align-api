@@ -1,8 +1,6 @@
 # whisper_api — Whisper STT + forced alignment on the L40S
 
 > **Full endpoint reference with request/response schemas and client examples: [API.md](API.md)** — or open `http://<IP>:8888/docs` for interactive Swagger docs.
->
-> **Browser test UI at `http://<IP>:8888/`** — record mic audio or upload a file, hit /transcribe or /align, and watch words light up karaoke-style during playback. (Mic recording requires HTTPS or localhost — use `ssh -L 8888:localhost:8888` and open http://localhost:8888.)
 
 One FastAPI service for QA-ing Hinglish TTS output and processing long lectures:
 
