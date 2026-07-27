@@ -1,5 +1,7 @@
 # whisper_api — Whisper STT + forced alignment on the L40S
 
+> **Full endpoint reference with request/response schemas and client examples: [API.md](API.md)** — or open `http://<IP>:8888/docs` for interactive Swagger docs.
+
 One FastAPI service for QA-ing Hinglish TTS output and processing long lectures:
 
 - **`POST /transcribe`** / **`POST /align`** — synchronous, for short clips (≤ `SYNC_MAX_SEC`, default 5 min).
