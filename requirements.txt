@@ -1,0 +1,12 @@
+# torch/torchaudio/torchvision are installed separately by setup_l40s.sh
+# from the driver-matched CUDA index (default cu128):
+#   torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0
+whisperx==3.8.6
+faster-whisper==1.2.1
+ctranslate2==4.8.1
+rapidfuzz==3.14.5
+indic-transliteration==2.3.82
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+requests>=2.31
