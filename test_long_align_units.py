@@ -9,6 +9,7 @@ import sys
 
 from long_align import (
     MAX_WINDOW_SEC,
+    _merge_short_runs,
     _script_runs,
     asr_token_times,
     build_windows,
@@ -163,6 +164,23 @@ check("single script -> one run", _script_runs(["a", "b", "c"]) == [(0, 3, "en")
 check("runs cover all tokens",
       runs[0][0] == 0 and runs[-1][1] == 7
       and all(a[1] == b[0] for a, b in zip(runs, runs[1:])))
+
+print("\n_merge_short_runs: code-switched Hinglish stays one run; sustained blocks split")
+# rapid hi/en switching (typical Hinglish sentence) -> merges to one hi-dominant run
+hinglish = "देखो अगर concept clear है exam के लिए तो numericals आसान होंगे".split()
+merged = _merge_short_runs(_script_runs(hinglish))
+check("code-switched sentence -> single run", len(merged) == 1, str(merged))
+check("dominant script wins", merged[0][2] == "hi", str(merged))
+# a sustained English passage next to a sustained Devanagari one -> two runs
+sustained = ["hello"] * 14 + ["आज"] * 12
+merged = _merge_short_runs(_script_runs(sustained))
+check("sustained blocks preserved", merged == [(0, 14, "en"), (14, 26, "hi")], str(merged))
+# short en run sandwiched by large hi runs -> absorbed
+sandwich = ["आज"] * 10 + ["ok", "so"] + ["हम"] * 10
+merged = _merge_short_runs(_script_runs(sandwich))
+check("short switch absorbed", merged == [(0, 22, "hi")], str(merged))
+check("merged runs still cover all tokens",
+      merged[0][0] == 0 and merged[-1][1] == 22)
 
 print("\nbuild_windows: single token, tiny audio")
 windows = build_windows(["hello"], [], 1.0)

@@ -138,6 +138,8 @@ def main():
     words = result["words"]
     print(f"\nmode={result.get('mode')} anchor_coverage={result.get('anchor_coverage')}"
           f" aligned {result['n_aligned']}/{result['n_words']}")
+    if result.get("chunk_stats"):
+        print(f"chunk_stats: {result['chunk_stats']}")
     for wmsg in result.get("warnings", []):
         print(f"  warning: {wmsg}")
 

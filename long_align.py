@@ -32,6 +32,8 @@ ANCHOR_NGRAM = 4            # n-gram size for unique (repetition-proof) anchors
 TARGET_WINDOW_SEC = 60.0
 MAX_WINDOW_SEC = 240.0  # safely under the ~7 min single-segment OOM wall
 WINDOW_PAD_SEC = 0.5
+MIN_SCRIPT_RUN_TOKENS = 8  # shorter script switches stay in the surrounding run
+RUN_PAD_SEC = 1.5          # run boundaries are anchor-interpolated (~+-2s), pad wide
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -317,6 +319,41 @@ def _script_runs(tokens: list[str]) -> list[tuple[int, int, str]]:
     return runs
 
 
+def _merge_short_runs(runs: list[tuple[int, int, str]],
+                      min_tokens: int = MIN_SCRIPT_RUN_TOKENS) -> list[tuple[int, int, str]]:
+    """Merge script runs shorter than min_tokens into their larger neighbor.
+
+    Code-switched Hinglish alternates script every few words; per-word model
+    switching fragments alignment. Only sustained blocks (a full English
+    passage inside a Devanagari script, or vice versa) deserve their own model
+    - embedded single words are handled fine by the surrounding run's model.
+    """
+    runs = list(runs)
+    while len(runs) > 1:
+        i = min(range(len(runs)), key=lambda k: runs[k][1] - runs[k][0])
+        if runs[i][1] - runs[i][0] >= min_tokens:
+            break
+        left = i - 1 if i > 0 else None
+        right = i + 1 if i < len(runs) - 1 else None
+        if left is None:
+            nb = right
+        elif right is None:
+            nb = left
+        else:
+            nb = left if (runs[left][1] - runs[left][0]) >= (runs[right][1] - runs[right][0]) else right
+        a, b = sorted((i, nb))
+        ra, rb = runs[a], runs[b]
+        script = ra[2] if (ra[1] - ra[0]) >= (rb[1] - rb[0]) else rb[2]
+        runs[a:b + 1] = [(ra[0], rb[1], script)]
+    out = []
+    for r in runs:
+        if out and out[-1][2] == r[2]:
+            out[-1] = (out[-1][0], r[1], r[2])
+        else:
+            out.append(r)
+    return out
+
+
 def _anchor_time_fn(anchors: list[tuple[int, float]], n_tokens: int, duration: float):
     """Piecewise-linear token-index -> audio-time map through the anchors."""
     xs = [0] + [a[0] for a in anchors if 0 < a[0] < n_tokens] + [n_tokens]
@@ -331,7 +368,8 @@ def _anchor_time_fn(anchors: list[tuple[int, float]], n_tokens: int, duration: f
 
 
 def _align_window(
-    tokens, t0, t1, audio, align_model, align_metadata, gpu_lock, sample_rate, depth=0
+    tokens, t0, t1, audio, align_model, align_metadata, gpu_lock, sample_rate,
+    depth=0, pad=WINDOW_PAD_SEC,
 ) -> list[dict]:
     """Align one window; returns one word dict per token (times absolute).
 
@@ -342,8 +380,8 @@ def _align_window(
     import whisperx
 
     duration = len(audio) / sample_rate
-    s = max(0.0, t0 - WINDOW_PAD_SEC)
-    e = min(duration, t1 + WINDOW_PAD_SEC)
+    s = max(0.0, t0 - pad)
+    e = min(duration, t1 + pad)
     chunk = audio[int(s * sample_rate): int(e * sample_rate)]
     if len(chunk) < sample_rate // 10:
         return _bare_words(tokens)
@@ -380,9 +418,9 @@ def _align_window(
         mid = len(tokens) // 2
         tmid = t0 + (t1 - t0) / 2
         return _align_window(tokens[:mid], t0, tmid, audio, align_model, align_metadata,
-                             gpu_lock, sample_rate, depth + 1) + \
+                             gpu_lock, sample_rate, depth + 1, pad) + \
                _align_window(tokens[mid:], tmid, t1, audio, align_model, align_metadata,
-                             gpu_lock, sample_rate, depth + 1)
+                             gpu_lock, sample_rate, depth + 1, pad)
     except Exception:
         log.exception("window align failed (%d tokens) - marking unaligned", len(tokens))
         return _bare_words(tokens)
@@ -470,16 +508,19 @@ def chunked_align(
         progress_cb(f"aligning window {i + 1}/{len(windows)}",
                     0.4 + 0.55 * i / max(len(windows), 1))
         toks = gt_tokens[win["tok_start"]: win["tok_end"]]
-        for r0, r1, script in _script_runs(toks):
+        for r0, r1, script in _merge_short_runs(_script_runs(toks)):
             n_runs += 1
             run_toks = toks[r0:r1]
             g0, g1 = win["tok_start"] + r0, win["tok_start"] + r1
+            full_window = r0 == 0 and r1 == len(toks)
             t0 = win["t0"] if r0 == 0 else max(win["t0"], tok_time(g0))
             t1 = win["t1"] if r1 == len(toks) else min(win["t1"], tok_time(g1))
             t1 = max(t1, t0 + 0.05)
             am_run = models.get(script) or default_model
-            words = _align_window(run_toks, t0, t1, audio,
-                                  am_run[0], am_run[1], gpu_lock, sample_rate)
+            words = _align_window(
+                run_toks, t0, t1, audio, am_run[0], am_run[1], gpu_lock, sample_rate,
+                pad=WINDOW_PAD_SEC if full_window else RUN_PAD_SEC,
+            )
             segments.append({"text": " ".join(run_toks), "start": t0, "end": t1,
                              "words": words})
     stats.update({"n_windows": len(windows), "n_runs": n_runs,
