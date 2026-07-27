@@ -319,16 +319,19 @@ def _script_runs(tokens: list[str]) -> list[tuple[int, int, str]]:
     return runs
 
 
-def _merge_short_runs(runs: list[tuple[int, int, str]],
+def _merge_short_runs(tokens: list[str],
                       min_tokens: int = MIN_SCRIPT_RUN_TOKENS) -> list[tuple[int, int, str]]:
-    """Merge script runs shorter than min_tokens into their larger neighbor.
+    """Script runs of `tokens`, with runs shorter than min_tokens merged into
+    their larger neighbor.
 
     Code-switched Hinglish alternates script every few words; per-word model
     switching fragments alignment. Only sustained blocks (a full English
     passage inside a Devanagari script, or vice versa) deserve their own model
     - embedded single words are handled fine by the surrounding run's model.
+    Each merged span's script is the majority script of its original tokens.
     """
-    runs = list(runs)
+    scripts = [_token_script(t) for t in tokens]
+    runs = _script_runs(tokens)
     while len(runs) > 1:
         i = min(range(len(runs)), key=lambda k: runs[k][1] - runs[k][0])
         if runs[i][1] - runs[i][0] >= min_tokens:
@@ -342,15 +345,15 @@ def _merge_short_runs(runs: list[tuple[int, int, str]],
         else:
             nb = left if (runs[left][1] - runs[left][0]) >= (runs[right][1] - runs[right][0]) else right
         a, b = sorted((i, nb))
-        ra, rb = runs[a], runs[b]
-        script = ra[2] if (ra[1] - ra[0]) >= (rb[1] - rb[0]) else rb[2]
-        runs[a:b + 1] = [(ra[0], rb[1], script)]
+        runs[a:b + 1] = [(runs[a][0], runs[b][1], "")]
     out = []
-    for r in runs:
-        if out and out[-1][2] == r[2]:
-            out[-1] = (out[-1][0], r[1], r[2])
+    for r0, r1, _ in runs:
+        n_hi = sum(1 for s in scripts[r0:r1] if s == "hi")
+        script = "hi" if n_hi * 2 >= (r1 - r0) else "en"
+        if out and out[-1][2] == script:
+            out[-1] = (out[-1][0], r1, script)
         else:
-            out.append(r)
+            out.append((r0, r1, script))
     return out
 
 
@@ -508,7 +511,7 @@ def chunked_align(
         progress_cb(f"aligning window {i + 1}/{len(windows)}",
                     0.4 + 0.55 * i / max(len(windows), 1))
         toks = gt_tokens[win["tok_start"]: win["tok_end"]]
-        for r0, r1, script in _merge_short_runs(_script_runs(toks)):
+        for r0, r1, script in _merge_short_runs(toks):
             n_runs += 1
             run_toks = toks[r0:r1]
             g0, g1 = win["tok_start"] + r0, win["tok_start"] + r1
