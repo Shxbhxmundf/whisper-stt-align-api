@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 import torch  # must be imported before whisperx so torch's bundled cuDNN is loaded first
 import whisperx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 import long_align
@@ -430,6 +431,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="whisper_api", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+# allow browser-based test tools running on other origins (e.g. a local HTML file)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")
