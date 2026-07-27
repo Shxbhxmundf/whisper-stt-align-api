@@ -53,6 +53,21 @@ JOBS_DIR = os.environ.get(
 DEVICE = "cuda"
 SAMPLE_RATE = 16000  # whisperx.load_audio always returns 16 kHz mono
 
+
+def _git_rev() -> str:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)), text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+APP_VERSION = _git_rev()
+
 GPU_LOCK = threading.Lock()
 WHISPER = None
 ALIGN_CACHE: dict = {}  # lang -> (model, metadata)
@@ -289,9 +304,9 @@ def run_align(audio_path: str, transcript: str, language: str | None, mode: str 
             f"of audio (got {duration:.0f}s) - use mode=chunked or mode=auto",
         )
 
-    anchor_coverage = None
+    anchor_coverage, chunk_stats = None, None
     if chunked:
-        segments, warnings, anchor_coverage = long_align.chunked_align(
+        segments, warnings, anchor_coverage, chunk_stats = long_align.chunked_align(
             audio, transcript_norm, am[0], am[1], WHISPER, GPU_LOCK,
             BATCH_SIZE, SAMPLE_RATE, progress_cb, get_align_model_fn=get_align_model,
         )
@@ -327,6 +342,8 @@ def run_align(audio_path: str, transcript: str, language: str | None, mode: str 
     }
     if anchor_coverage is not None:
         resp["anchor_coverage"] = round(anchor_coverage, 3)
+    if chunk_stats is not None:
+        resp["chunk_stats"] = chunk_stats
     return resp
 
 
@@ -419,6 +436,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 def health():
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "gpu": torch.cuda.get_device_name(0),
         "cuda": torch.cuda.is_available(),
         "whisper_model": WHISPER_MODEL,

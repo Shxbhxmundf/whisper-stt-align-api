@@ -9,6 +9,7 @@ import sys
 
 from long_align import (
     MAX_WINDOW_SEC,
+    _script_runs,
     asr_token_times,
     build_windows,
     find_anchors,
@@ -154,6 +155,14 @@ windows = build_windows(gt, [], 1800.0)
 check("still partitions", windows[0]["tok_start"] == 0 and windows[-1]["tok_end"] == len(gt))
 check("all spans <= MAX", all(w["t1"] - w["t0"] <= MAX_WINDOW_SEC + 0.1 for w in windows))
 check("flagged low confidence", all(w["low_confidence"] for w in windows))
+
+print("\n_script_runs: mixed-script spans split at script boundaries")
+runs = _script_runs("hello world आज हम पढ़ेंगे ok bye".split())
+check("run structure", runs == [(0, 2, "en"), (2, 5, "hi"), (5, 7, "en")], str(runs))
+check("single script -> one run", _script_runs(["a", "b", "c"]) == [(0, 3, "en")])
+check("runs cover all tokens",
+      runs[0][0] == 0 and runs[-1][1] == 7
+      and all(a[1] == b[0] for a, b in zip(runs, runs[1:])))
 
 print("\nbuild_windows: single token, tiny audio")
 windows = build_windows(["hello"], [], 1.0)

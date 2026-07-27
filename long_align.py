@@ -299,6 +299,37 @@ def _bare_words(tokens: list[str]) -> list[dict]:
     return [{"word": t} for t in tokens]
 
 
+def _token_script(tok: str) -> str:
+    return "hi" if _DEVANAGARI.search(tok) else "en"
+
+
+def _script_runs(tokens: list[str]) -> list[tuple[int, int, str]]:
+    """Split a token span into consecutive same-script runs [(start, end, script)].
+    Alignment models are per-script; Latin text fed to the Devanagari model (or
+    vice versa) aligns poorly, so mixed-script windows must be aligned per run."""
+    runs = []
+    for i, tok in enumerate(tokens):
+        s = _token_script(tok)
+        if runs and runs[-1][2] == s:
+            runs[-1] = (runs[-1][0], i + 1, s)
+        else:
+            runs.append((i, i + 1, s))
+    return runs
+
+
+def _anchor_time_fn(anchors: list[tuple[int, float]], n_tokens: int, duration: float):
+    """Piecewise-linear token-index -> audio-time map through the anchors."""
+    xs = [0] + [a[0] for a in anchors if 0 < a[0] < n_tokens] + [n_tokens]
+    ys = [0.0] + [a[1] for a in anchors if 0 < a[0] < n_tokens] + [duration]
+
+    def f(i: float) -> float:
+        j = min(max(bisect.bisect_right(xs, i) - 1, 0), len(xs) - 2)
+        x0, x1, y0, y1 = xs[j], xs[j + 1], ys[j], ys[j + 1]
+        return y0 if x1 == x0 else y0 + (y1 - y0) * (i - x0) / (x1 - x0)
+
+    return f
+
+
 def _align_window(
     tokens, t0, t1, audio, align_model, align_metadata, gpu_lock, sample_rate, depth=0
 ) -> list[dict]:
@@ -368,19 +399,21 @@ def chunked_align(
     sample_rate: int,
     progress_cb=lambda stage, progress=0.0: None,
     get_align_model_fn=None,
-) -> tuple[list[dict], list[str], float]:
+) -> tuple[list[dict], list[str], float, dict]:
     """Full long-form pipeline. Returns (segments-with-words for postprocess_words,
-    warnings, anchor_coverage). Every GT whitespace token appears exactly once."""
+    warnings, anchor_coverage, stats). Every GT whitespace token appears exactly once."""
     import whisperx
 
     gt_tokens = transcript_norm.split(" ")
     duration = len(audio) / sample_rate
     warnings = []
 
+    stats = {"asr_word_timing": False, "asr_language": None}
     progress_cb("transcribing", 0.05)
     with gpu_lock:
         asr = whisper_model.transcribe(audio, batch_size=batch_size)
     asr_segments = asr["segments"]
+    stats["asr_language"] = asr.get("language")
 
     # Acoustic word times for the ASR stream (align model picked by the ASR
     # text's own script - Whisper may emit Devanagari against a Latin GT).
@@ -399,6 +432,7 @@ def chunked_align(
                         asr_segments, am2[0], am2[1], audio, "cuda",
                         return_char_alignments=False,
                     )["segments"]
+                stats["asr_word_timing"] = True
             except Exception:
                 log.exception("asr word-timing pass failed; using segment interpolation")
 
@@ -414,21 +448,41 @@ def chunked_align(
             f"{coverage:.2f}); returning uniformly distributed unaligned words"
         )
         return ([{"text": transcript_norm, "start": 0.0, "end": duration,
-                  "words": _bare_words(gt_tokens)}], warnings, coverage)
+                  "words": _bare_words(gt_tokens)}], warnings, coverage, stats)
 
     windows = build_windows(gt_tokens, anchors, duration)
     n_low = sum(1 for w in windows if w["low_confidence"])
     if n_low:
         warnings.append(f"{n_low}/{len(windows)} windows had sparse anchors (low confidence)")
 
-    segments = []
+    # Each same-script run inside a window is aligned with the model matching
+    # ITS script (run boundaries timed via the anchor map). Feeding Latin text
+    # to the Devanagari model (or vice versa) smears the alignment.
+    tok_time = _anchor_time_fn(anchors, len(gt_tokens), duration)
+    models = {}
+    if get_align_model_fn is not None:
+        for lang in ("en", "hi"):
+            models[lang] = get_align_model_fn(lang)
+    default_model = (align_model, align_metadata)
+
+    segments, n_runs = [], 0
     for i, win in enumerate(windows):
         progress_cb(f"aligning window {i + 1}/{len(windows)}",
                     0.4 + 0.55 * i / max(len(windows), 1))
         toks = gt_tokens[win["tok_start"]: win["tok_end"]]
-        words = _align_window(toks, win["t0"], win["t1"], audio,
-                              align_model, align_metadata, gpu_lock, sample_rate)
-        segments.append({"text": " ".join(toks), "start": win["t0"], "end": win["t1"],
-                         "words": words})
+        for r0, r1, script in _script_runs(toks):
+            n_runs += 1
+            run_toks = toks[r0:r1]
+            g0, g1 = win["tok_start"] + r0, win["tok_start"] + r1
+            t0 = win["t0"] if r0 == 0 else max(win["t0"], tok_time(g0))
+            t1 = win["t1"] if r1 == len(toks) else min(win["t1"], tok_time(g1))
+            t1 = max(t1, t0 + 0.05)
+            am_run = models.get(script) or default_model
+            words = _align_window(run_toks, t0, t1, audio,
+                                  am_run[0], am_run[1], gpu_lock, sample_rate)
+            segments.append({"text": " ".join(run_toks), "start": t0, "end": t1,
+                             "words": words})
+    stats.update({"n_windows": len(windows), "n_runs": n_runs,
+                  "n_anchors": len(anchors)})
     progress_cb("postprocessing", 0.97)
-    return segments, warnings, coverage
+    return segments, warnings, coverage, stats
