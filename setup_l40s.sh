@@ -18,7 +18,12 @@ for arg in "$@"; do
 done
 
 echo "== GPU =="
-nvidia-smi | head -n 10 || { echo "nvidia-smi failed - is this the GPU box?"; exit 1; }
+# capture first, then trim - `nvidia-smi | head` under pipefail dies of SIGPIPE
+if ! SMI_OUT="$(nvidia-smi 2>&1)"; then
+  echo "nvidia-smi failed - is this the GPU box?"
+  exit 1
+fi
+head -n 10 <<< "${SMI_OUT}"
 
 echo "== venv =="
 # clean, isolated venv - never --system-site-packages (causes CPU fallback / libcupti issues)
