@@ -10,11 +10,13 @@ Heavy imports (torch/whisperx) are function-local so the anchoring/windowing
 logic stays unit-testable on a machine without GPU deps.
 """
 
+import bisect
 import difflib
 import logging
 import math
 import re
 import unicodedata
+from collections import Counter
 
 from indic_transliteration import sanscript
 from rapidfuzz import fuzz
@@ -24,6 +26,9 @@ log = logging.getLogger("whisper_api.long_align")
 MIN_ANCHOR_TOKENS = 3
 ANCHOR_FUZZ_MIN = 70
 MIN_ANCHOR_COVERAGE = 0.15
+ANCHOR_BLOCK_TOKENS = 60    # GT tokens matched per band
+ANCHOR_SLACK_TOKENS = 60    # ASR tokens of slack around the mapped position
+ANCHOR_NGRAM = 4            # n-gram size for unique (repetition-proof) anchors
 TARGET_WINDOW_SEC = 60.0
 MAX_WINDOW_SEC = 240.0  # safely under the ~7 min single-segment OOM wall
 WINDOW_PAD_SEC = 0.5
@@ -81,15 +86,79 @@ def asr_token_times(asr_segments: list[dict]) -> tuple[list[str], list[float]]:
     return tokens, times
 
 
+def _lis(points: list[tuple], value) -> list[tuple]:
+    """Longest subsequence of `points` (already sorted by primary coord) with
+    strictly increasing value(point). O(n log n). Keeps the maximum number of
+    mutually consistent anchors instead of greedily locking onto an early outlier."""
+    if not points:
+        return []
+    tails, tails_at, parent = [], [], [None] * len(points)
+    for i, p in enumerate(points):
+        v = value(p)
+        k = bisect.bisect_left(tails, v)
+        if k == len(tails):
+            tails.append(v)
+            tails_at.append(i)
+        else:
+            tails[k] = v
+            tails_at[k] = i
+        parent[i] = tails_at[k - 1] if k > 0 else None
+    out, i = [], tails_at[-1]
+    while i is not None:
+        out.append(points[i])
+        i = parent[i]
+    return out[::-1]
+
+
+def _unique_ngram_pairs(gt_keys: list[str], asr_keys: list[str], n: int) -> list[tuple[int, int]]:
+    """(gt_idx, asr_idx) for n-grams occurring exactly once in BOTH streams.
+    Such anchors cannot be phase-confused by repeated content, by construction."""
+    gt_grams = [tuple(gt_keys[i:i + n]) for i in range(len(gt_keys) - n + 1)]
+    asr_grams = [tuple(asr_keys[i:i + n]) for i in range(len(asr_keys) - n + 1)]
+    gt_counts, asr_counts = Counter(gt_grams), Counter(asr_grams)
+    asr_pos = {g: i for i, g in enumerate(asr_grams) if asr_counts[g] == 1}
+    pairs = [
+        (i, asr_pos[g])
+        for i, g in enumerate(gt_grams)
+        if gt_counts[g] == 1 and g in asr_pos
+    ]
+    return _lis(sorted(pairs), lambda p: p[1])
+
+
+def _interp_map(pairs: list[tuple[int, int]], n_gt: int, n_asr: int):
+    """Piecewise-linear gt_idx -> asr_idx map through sparse anchor pairs,
+    extended to the boundaries with the global ratio slope."""
+    r = n_asr / max(n_gt, 1)
+    if not pairs:
+        return lambda i: i * r
+    xs = [p[0] for p in pairs]
+    ys = [float(p[1]) for p in pairs]
+    xs = [0] + xs + [n_gt]
+    ys = [max(0.0, ys[0] - pairs[0][0] * r)] + ys + [min(float(n_asr), ys[-1] + (n_gt - pairs[-1][0]) * r)]
+
+    def f(i: float) -> float:
+        j = min(max(bisect.bisect_right(xs, i) - 1, 0), len(xs) - 2)
+        x0, x1, y0, y1 = xs[j], xs[j + 1], ys[j], ys[j + 1]
+        return y0 if x1 == x0 else y0 + (y1 - y0) * (i - x0) / (x1 - x0)
+
+    return f
+
+
 def find_anchors(
     gt_tokens: list[str], asr_tokens: list[str], asr_times: list[float]
 ) -> tuple[list[tuple[int, float]], float]:
     """Match GT tokens to ASR tokens on normalized keys.
 
-    Returns (anchor points [(gt_token_index, audio_time)...] strictly monotonic
-    in both index and time, coverage = matched fraction of matchable GT tokens).
-    Monotonicity filtering is mandatory: lectures repeat phrases, and a match
-    against the wrong occurrence would fold time backwards.
+    Repetition-safe two-stage matching (lectures repeat phrases verbatim; a
+    single global SequenceMatcher phase-shifts onto the wrong occurrence):
+      A. unique-n-gram anchors (occur once in both streams -> unambiguous)
+         fit a piecewise-linear GT->ASR position map;
+      B. SequenceMatcher runs banded around that map with tight slack, so a
+         repeat further than ~ANCHOR_SLACK_TOKENS away is unreachable.
+    Final points are LIS-filtered to be strictly monotonic in index and time.
+
+    Returns (anchor points [(gt_token_index, audio_time)...], coverage =
+    kept fraction of matchable GT tokens).
     """
     gt_keys, gt_map = [], []
     for i, t in enumerate(gt_tokens):
@@ -106,26 +175,32 @@ def find_anchors(
     if not gt_keys or not asr_keys:
         return [], 0.0
 
-    sm = difflib.SequenceMatcher(None, gt_keys, asr_keys, autojunk=False)
-    points, matched = [], 0
-    for a, b, size in sm.get_matching_blocks():
-        if size < MIN_ANCHOR_TOKENS:
+    amap = _interp_map(
+        _unique_ngram_pairs(gt_keys, asr_keys, ANCHOR_NGRAM), len(gt_keys), len(asr_keys)
+    )
+
+    points = []
+    for b0 in range(0, len(gt_keys), ANCHOR_BLOCK_TOKENS):
+        b1 = min(b0 + ANCHOR_BLOCK_TOKENS, len(gt_keys))
+        lo = max(0, int(amap(b0)) - ANCHOR_SLACK_TOKENS)
+        hi = min(len(asr_keys), int(amap(b1)) + ANCHOR_SLACK_TOKENS)
+        if hi <= lo:
             continue
-        gt_raw = " ".join(gt_tokens[gt_map[a + k]] for k in range(size))
-        asr_raw = " ".join(asr_tokens[asr_map[b + k]] for k in range(size))
-        if fuzz.ratio(gt_raw.lower(), asr_raw.lower()) < ANCHOR_FUZZ_MIN:
-            continue
-        matched += size
-        for k in range(size):
-            points.append((gt_map[a + k], asr_times[asr_map[b + k]]))
+        sm = difflib.SequenceMatcher(None, gt_keys[b0:b1], asr_keys[lo:hi], autojunk=False)
+        for a, b, size in sm.get_matching_blocks():
+            if size < MIN_ANCHOR_TOKENS:
+                continue
+            a, b = b0 + a, lo + b
+            gt_raw = " ".join(gt_tokens[gt_map[a + k]] for k in range(size))
+            asr_raw = " ".join(asr_tokens[asr_map[b + k]] for k in range(size))
+            if fuzz.ratio(gt_raw.lower(), asr_raw.lower()) < ANCHOR_FUZZ_MIN:
+                continue
+            for k in range(size):
+                points.append((gt_map[a + k], asr_times[asr_map[b + k]]))
 
     points.sort(key=lambda p: p[0])
-    monotonic, last_t = [], -1.0
-    for idx, t in points:
-        if t > last_t:
-            monotonic.append((idx, t))
-            last_t = t
-    return monotonic, matched / len(gt_keys)
+    kept = _lis(points, lambda p: p[1])
+    return kept, len(kept) / len(gt_keys)
 
 
 def build_windows(

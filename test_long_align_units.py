@@ -94,6 +94,24 @@ check("cyclic coverage still above wrong-file cutoff", cov_c >= 0.15, f"{cov_c:.
 ts_c = [a[1] for a in anchors_c]
 check("cyclic anchors monotonic", all(a < b for a, b in zip(ts_c, ts_c[1:])))
 
+print("\nfind_anchors: 3x-verbatim-repeated content must not phase-shift (cycle jump)")
+random.seed(7)
+sentences = [[random.choice(VOCAB) for _ in range(15)] for _ in range(15)]  # 225-token cycle
+gt_rep = [t for _ in range(3) for s in sentences for t in s] + [t for s in sentences[:5] for t in s]
+asr_rep, rep_times, t_acc = [], [], 0.0
+for tok in gt_rep:
+    p = perturb(tok)
+    if p is not None:
+        asr_rep.append(p)
+        rep_times.append(t_acc)
+    t_acc += 0.45
+gt_true_times = [i * 0.45 for i in range(len(gt_rep))]
+anchors_r, cov_r = find_anchors(gt_rep, asr_rep, rep_times)
+errs = [abs(at - gt_true_times[gi]) for gi, at in anchors_r]
+check("repeated-content coverage > 0.5", cov_r > 0.5, f"{cov_r:.2f}")
+check("no anchor off by a cycle (all errors < 20s)",
+      max(errs) < 20, f"max_err={max(errs):.1f}s")
+
 print("\nfind_anchors: unrelated transcript -> near-zero coverage")
 _, cov_bad = find_anchors(
     "completely different english words about cooking pasta recipes tonight".split(),
