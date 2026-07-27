@@ -25,7 +25,9 @@ from contextlib import asynccontextmanager
 import torch  # must be imported before whisperx so torch's bundled cuDNN is loaded first
 import whisperx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse
 
 import long_align
 from jobs_store import JobStore
@@ -430,6 +432,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="whisper_api", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    if not os.path.exists(UI_PATH):
+        raise HTTPException(status_code=404, detail="ui.html not found")
+    return FileResponse(UI_PATH, media_type="text/html")
 
 
 @app.get("/health")
